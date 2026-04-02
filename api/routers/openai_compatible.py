@@ -207,51 +207,40 @@ async def create_speech(
                 },
             )
 
-        # Resolve voice name before cache lookup so cache key is canonical
+        # Resolve params before cache lookup
         voice_name = get_voice_name(request.voice)
+        model_language = extract_language_from_model(request.model)
+        language = model_language if model_language else (request.language or "Auto")
+        instruct = request.instruct or ""
 
-        # Check persistent audio cache
+        # Check persistent audio cache (includes all synthesis-affecting params)
         cached_path = await get_cached(
-            text=normalized_text,
-            voice=voice_name,
-            speed=request.speed,
-            fmt=request.response_format,
+            text=normalized_text, voice=voice_name, speed=request.speed,
+            fmt=request.response_format, language=language, instruct=instruct,
         )
         if cached_path:
             content_type = get_content_type(request.response_format)
             return FileResponse(
-                cached_path,
-                media_type=content_type,
+                cached_path, media_type=content_type,
                 headers={
                     "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
                     "X-Cache": "HIT",
                 },
             )
 
-        # Extract language from model name if present, otherwise use request language
-        model_language = extract_language_from_model(request.model)
-        language = model_language if model_language else (request.language or "Auto")
-
-        # Generate speech (pass resolved voice_name, not raw request.voice)
+        # Generate speech
         audio, sample_rate = await generate_speech(
-            text=normalized_text,
-            voice=voice_name,
-            language=language,
-            instruct=request.instruct,
-            speed=request.speed,
+            text=normalized_text, voice=voice_name, language=language,
+            instruct=request.instruct, speed=request.speed,
         )
 
-        # Encode audio to requested format
+        # Encode and cache
         audio_bytes = encode_audio(audio, request.response_format, sample_rate)
-
-        # Cache the result
         try:
             await put_cached(
-                text=normalized_text,
-                voice=voice_name,
-                speed=request.speed,
-                fmt=request.response_format,
-                data=audio_bytes,
+                text=normalized_text, voice=voice_name, speed=request.speed,
+                fmt=request.response_format, data=audio_bytes,
+                language=language, instruct=instruct,
             )
         except Exception as cache_err:
             logger.warning(f"Failed to cache audio: {cache_err}")

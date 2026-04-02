@@ -29,9 +29,10 @@ _write_count = 0
 _cleanup_running = False
 
 
-def _cache_key(text: str, voice: str, speed: float, fmt: str) -> str:
-    """Deterministic hash of synthesis parameters."""
-    raw = f"{text}|{voice}|{speed:.2f}|{fmt}"
+def _cache_key(text: str, voice: str, speed: float, fmt: str,
+               language: str = "Auto", instruct: str = "") -> str:
+    """Deterministic hash of all synthesis-affecting parameters."""
+    raw = f"{text}|{voice}|{speed:.2f}|{fmt}|{language}|{instruct}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -41,10 +42,11 @@ def _cache_path(key: str, fmt: str) -> str:
 
 
 async def get_cached(
-    text: str, voice: str, speed: float, fmt: str
+    text: str, voice: str, speed: float, fmt: str,
+    language: str = "Auto", instruct: str = "",
 ) -> Optional[str]:
     """Return path to cached audio file if it exists, else None."""
-    key = _cache_key(text, voice, speed, fmt)
+    key = _cache_key(text, voice, speed, fmt, language, instruct)
     path = _cache_path(key, fmt)
     if await aiofiles.os.path.exists(path):
         # Touch access time in thread pool so LRU cleanup works
@@ -59,16 +61,19 @@ async def get_cached(
 
 
 async def put_cached(
-    text: str, voice: str, speed: float, fmt: str, data: bytes
+    text: str, voice: str, speed: float, fmt: str, data: bytes,
+    language: str = "Auto", instruct: str = "",
 ) -> str:
-    """Write audio data to cache and return the file path."""
+    """Write audio data to cache atomically and return the file path."""
     global _write_count
-    key = _cache_key(text, voice, speed, fmt)
+    key = _cache_key(text, voice, speed, fmt, language, instruct)
     path = _cache_path(key, fmt)
+    tmp_path = path + ".tmp"
     directory = os.path.dirname(path)
     await aiofiles.os.makedirs(directory, exist_ok=True)
-    async with aiofiles.open(path, "wb") as f:
+    async with aiofiles.open(tmp_path, "wb") as f:
         await f.write(data)
+    os.replace(tmp_path, path)  # atomic on same filesystem
     logger.info(f"Cache STORE: {key[:12]}... ({len(data)} bytes)")
 
     _write_count += 1

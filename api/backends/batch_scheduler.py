@@ -6,19 +6,20 @@ gets a Future that resolves when the batch completes.
 
 Batch fires when max_batch_size items are queued OR max_wait_ms has elapsed
 since the first item entered the current batch (whichever comes first).
+Items are grouped by (voice, language, instruct) before batching.
 """
 
 import asyncio
 import logging
 import os
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Config from env
 BATCH_MAX_SIZE = int(os.getenv("TTS_BATCH_MAX_SIZE", "4"))
 BATCH_MAX_WAIT_MS = int(os.getenv("TTS_BATCH_MAX_WAIT_MS", "50"))
 
@@ -37,17 +38,12 @@ class BatchScheduler:
     """Batches concurrent TTS requests into single model forward passes."""
 
     def __init__(self, backend):
-        """
-        Args:
-            backend: An initialized OfficialQwen3TTSBackend instance.
-        """
         self._backend = backend
         self._queue: asyncio.Queue = asyncio.Queue()
         self._processor_task: Optional[asyncio.Task] = None
         self._shutdown = False
 
     async def start(self):
-        """Start the background batch processor loop."""
         self._shutdown = False
         self._processor_task = asyncio.create_task(self._process_loop())
         logger.info(
@@ -56,59 +52,52 @@ class BatchScheduler:
         )
 
     async def stop(self):
-        """Stop the scheduler and cancel pending items."""
+        """Stop the scheduler. Fails any pending futures gracefully."""
         self._shutdown = True
+        # Push sentinel to unblock the loop
+        await self._queue.put(None)
         if self._processor_task and not self._processor_task.done():
-            self._processor_task.cancel()
             try:
-                await self._processor_task
-            except asyncio.CancelledError:
-                pass
-        # Fail any remaining items in the queue
+                await asyncio.wait_for(self._processor_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                self._processor_task.cancel()
+                try:
+                    await self._processor_task
+                except asyncio.CancelledError:
+                    pass
+        # Drain any remaining items
         while not self._queue.empty():
             item = self._queue.get_nowait()
-            if item.future and not item.future.done():
+            if item is not None and item.future and not item.future.done():
                 item.future.set_exception(RuntimeError("Scheduler stopped"))
         logger.info("BatchScheduler stopped")
 
     async def submit(
-        self,
-        text: str,
-        voice: str,
-        language: str,
-        instruct: Optional[str],
-        speed: float,
+        self, text: str, voice: str, language: str,
+        instruct: Optional[str], speed: float,
     ) -> Tuple[np.ndarray, int]:
-        """Submit a single TTS request. Blocks until the batch completes.
-
-        Returns:
-            Tuple of (audio_array, sample_rate)
-        """
         if self._shutdown:
             raise RuntimeError("BatchScheduler is stopped")
-
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         item = BatchItem(
-            text=text,
-            voice=voice,
-            language=language,
-            instruct=instruct,
-            speed=speed,
-            future=future,
+            text=text, voice=voice, language=language,
+            instruct=instruct, speed=speed, future=future,
         )
         await self._queue.put(item)
         return await future
 
     async def _process_loop(self):
-        """Main loop: collect items into batches, execute them."""
-        while not self._shutdown:
-            try:
-                # Wait for at least one item
+        batch: List[BatchItem] = []
+        try:
+            while not self._shutdown:
+                # Wait for first item
                 first = await self._queue.get()
+                if first is None:  # sentinel
+                    break
                 batch = [first]
 
-                # Collect more items within the time window
+                # Collect more within time window
                 deadline = asyncio.get_event_loop().time() + BATCH_MAX_WAIT_MS / 1000
                 while len(batch) < BATCH_MAX_SIZE:
                     remaining = deadline - asyncio.get_event_loop().time()
@@ -118,22 +107,28 @@ class BatchScheduler:
                         item = await asyncio.wait_for(
                             self._queue.get(), timeout=remaining
                         )
+                        if item is None:  # sentinel
+                            self._shutdown = True
+                            break
                         batch.append(item)
                     except asyncio.TimeoutError:
                         break
 
-                logger.info(f"Executing batch of {len(batch)} item(s)")
-                await self._execute_batch(batch)
+                if batch:
+                    logger.info(f"Executing batch of {len(batch)} item(s)")
+                    await self._execute_batch(batch)
+                    batch = []
 
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in batch processor loop: {e}")
-                await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            # Fail any items that were dequeued but not resolved
+            for item in batch:
+                if item.future and not item.future.done():
+                    item.future.set_exception(RuntimeError("Scheduler stopped"))
 
     async def _execute_batch(self, batch: List[BatchItem]):
-        """Run a batch through the model and resolve each item's future."""
-        # Ensure model is loaded
+        """Run batch, grouping by (voice, language, instruct) for correctness."""
         if not self._backend.is_ready():
             try:
                 await self._backend.initialize()
@@ -143,47 +138,50 @@ class BatchScheduler:
                         item.future.set_exception(e)
                 return
 
-        try:
-            texts = [item.text for item in batch]
-            voice = batch[0].voice
-            language = batch[0].language
-            instruct = batch[0].instruct
+        # Group items by synthesis parameters
+        groups: Dict[tuple, List[BatchItem]] = defaultdict(list)
+        for item in batch:
+            key = (item.voice, item.language, item.instruct or "")
+            groups[key].append(item)
 
-            # Run batch inference in thread executor (model call is synchronous)
-            loop = asyncio.get_running_loop()
-            wavs, sr = await loop.run_in_executor(
-                None,
-                self._backend.generate_batch_sync,
-                texts, voice, language, instruct,
-            )
+        for (voice, language, instruct), group_items in groups.items():
+            try:
+                texts = [item.text for item in group_items]
+                inst = instruct if instruct else None
 
-            # Fan out results + per-item speed adjustment
-            for i, item in enumerate(batch):
-                if item.future.done():
-                    continue
-                try:
-                    audio = wavs[i]
-                    if item.speed != 1.0:
-                        try:
-                            import librosa
-                            audio = librosa.effects.time_stretch(
-                                audio.astype(np.float32), rate=item.speed
-                            )
-                        except ImportError:
-                            pass
-                    item.future.set_result((audio, sr))
-                except Exception as e:
-                    item.future.set_exception(
-                        RuntimeError(f"Post-processing failed for batch item {i}: {e}")
-                    )
+                loop = asyncio.get_running_loop()
+                wavs, sr = await loop.run_in_executor(
+                    None,
+                    self._backend.generate_batch_sync,
+                    texts, voice, language, inst,
+                )
 
-        except Exception as e:
-            logger.error(f"Batch execution failed: {e}")
-            for item in batch:
-                if not item.future.done():
-                    item.future.set_exception(
-                        RuntimeError(f"Batch inference failed: {e}")
-                    )
+                for i, item in enumerate(group_items):
+                    if item.future.done():
+                        continue
+                    try:
+                        audio = wavs[i]
+                        if item.speed != 1.0:
+                            try:
+                                import librosa
+                                audio = librosa.effects.time_stretch(
+                                    audio.astype(np.float32), rate=item.speed
+                                )
+                            except ImportError:
+                                logger.warning("librosa not installed, speed adjustment skipped")
+                        item.future.set_result((audio, sr))
+                    except Exception as e:
+                        item.future.set_exception(
+                            RuntimeError(f"Post-processing failed: {e}")
+                        )
+
+            except Exception as e:
+                logger.error(f"Batch group execution failed: {e}")
+                for item in group_items:
+                    if not item.future.done():
+                        item.future.set_exception(
+                            RuntimeError(f"Batch inference failed: {e}")
+                        )
 
     @property
     def is_running(self) -> bool:

@@ -21,6 +21,14 @@ logger = logging.getLogger(__name__)
 _backend_instance: Optional[TTSBackend] = None
 # Global batch scheduler (replaces model pool)
 _batch_scheduler: Optional[BatchScheduler] = None
+# Lifecycle lock to prevent concurrent init/unload
+_lifecycle_lock: Optional[asyncio.Lock] = None
+
+def _get_lifecycle_lock() -> asyncio.Lock:
+    global _lifecycle_lock
+    if _lifecycle_lock is None:
+        _lifecycle_lock = asyncio.Lock()
+    return _lifecycle_lock
 
 # Activity tracking for auto-unload
 _last_activity_time: float = 0.0
@@ -89,35 +97,38 @@ async def initialize_backend(warmup: bool = False) -> TTSBackend:
     """Initialize the backend. For official backend, loads 1 model and starts batch scheduler."""
     global _batch_scheduler
 
-    backend = get_backend()
-    backend_type = os.getenv("TTS_BACKEND", "official").lower()
+    async with _get_lifecycle_lock():
+        # Skip if already initialized
+        if _batch_scheduler is not None and _batch_scheduler.is_running:
+            return get_backend()
 
-    if backend_type == "official":
-        # Load single model instance
-        await backend.initialize()
-        # Start batch scheduler on top of it
-        _batch_scheduler = BatchScheduler(backend)
-        await _batch_scheduler.start()
-        logger.info("Batch scheduler started on single model instance")
-    else:
-        # vllm: single instance, no batching
-        await backend.initialize()
+        backend = get_backend()
+        backend_type = os.getenv("TTS_BACKEND", "official").lower()
 
-        if warmup:
-            warmup_enabled = os.getenv("TTS_WARMUP_ON_START", "false").lower() == "true"
-            if warmup_enabled:
-                logger.info("Performing backend warmup...")
-                try:
-                    await backend.generate_speech(
-                        text="Hello, this is a warmup test.",
-                        voice="Vivian",
-                        language="English",
-                    )
-                    logger.info("Backend warmup completed successfully")
-                except Exception as e:
-                    logger.warning(f"Backend warmup failed (non-critical): {e}")
+        if backend_type == "official":
+            await backend.initialize()
+            _batch_scheduler = BatchScheduler(backend)
+            await _batch_scheduler.start()
+            logger.info("Batch scheduler started on single model instance")
+        else:
+            # vllm: single instance, no batching
+            await backend.initialize()
 
-    return backend
+            if warmup:
+                warmup_enabled = os.getenv("TTS_WARMUP_ON_START", "false").lower() == "true"
+                if warmup_enabled:
+                    logger.info("Performing backend warmup...")
+                    try:
+                        await backend.generate_speech(
+                            text="Hello, this is a warmup test.",
+                            voice="Vivian",
+                            language="English",
+                        )
+                        logger.info("Backend warmup completed successfully")
+                    except Exception as e:
+                        logger.warning(f"Backend warmup failed (non-critical): {e}")
+
+        return backend
 
 
 def reset_backend() -> None:
@@ -130,32 +141,31 @@ async def unload_backend() -> bool:
     """Unload the TTS backend to free GPU VRAM."""
     global _backend_instance, _batch_scheduler, _last_activity_time
 
-    unloaded = False
+    async with _get_lifecycle_lock():
+        unloaded = False
 
-    # Stop batch scheduler
-    if _batch_scheduler is not None:
-        try:
-            await _batch_scheduler.stop()
-            _batch_scheduler = None
-            logger.info("Batch scheduler stopped")
-        except Exception as e:
-            logger.error(f"Failed to stop batch scheduler: {e}")
+        if _batch_scheduler is not None:
+            try:
+                await _batch_scheduler.stop()
+                _batch_scheduler = None
+                logger.info("Batch scheduler stopped")
+            except Exception as e:
+                logger.error(f"Failed to stop batch scheduler: {e}")
 
-    # Unload backend
-    if _backend_instance is not None and _backend_instance.is_ready():
-        try:
-            await _backend_instance.unload()
-            unloaded = True
-            logger.info("Backend unloaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to unload backend: {e}")
+        if _backend_instance is not None and _backend_instance.is_ready():
+            try:
+                await _backend_instance.unload()
+                unloaded = True
+                logger.info("Backend unloaded successfully")
+            except Exception as e:
+                logger.error(f"Failed to unload backend: {e}")
 
-    if unloaded:
-        _last_activity_time = 0.0
-    else:
-        logger.info("Nothing to unload")
+        if unloaded:
+            _last_activity_time = 0.0
+        else:
+            logger.info("Nothing to unload")
 
-    return unloaded
+        return unloaded
 
 
 async def _auto_unload_checker() -> None:
