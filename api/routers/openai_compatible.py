@@ -11,11 +11,12 @@ from typing import List, Optional
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from ..structures.schemas import OpenAISpeechRequest, ModelInfo, VoiceInfo
 from ..services.text_processing import normalize_text
 from ..services.audio_encoding import encode_audio, get_content_type, DEFAULT_SAMPLE_RATE
+from ..services.audio_cache import get_cached, put_cached
 
 logger = logging.getLogger(__name__)
 
@@ -124,17 +125,14 @@ def extract_language_from_model(model_name: str) -> Optional[str]:
 
 
 async def get_tts_backend():
-    """Get the TTS backend instance, initializing if needed."""
+    """Get the TTS backend instance for non-synthesis ops (voice listing, etc.)."""
     from ..backends import get_backend, initialize_backend, update_activity
-    
+
+    update_activity()
+
     backend = get_backend()
-    
     if not backend.is_ready():
         await initialize_backend()
-    
-    # Track activity for auto-unload feature
-    update_activity()
-    
     return backend
 
 
@@ -154,38 +152,24 @@ async def generate_speech(
     instruct: Optional[str] = None,
     speed: float = 1.0,
 ) -> tuple[np.ndarray, int]:
-    """
-    Generate speech from text using the configured TTS backend.
-    
-    Args:
-        text: The text to synthesize
-        voice: Voice name to use
-        language: Language code
-        instruct: Optional instruction for voice style
-        speed: Speech speed multiplier
-    
-    Returns:
-        Tuple of (audio_array, sample_rate)
-    """
-    backend = await get_tts_backend()
-    
-    # Map voice name
+    """Generate speech using batch scheduler (official) or single backend (vllm)."""
+    from ..backends import get_batch_scheduler, update_activity
+
+    update_activity()
     voice_name = get_voice_name(voice)
-    
-    # Generate speech using the backend
-    try:
-        audio, sr = await backend.generate_speech(
-            text=text,
-            voice=voice_name,
-            language=language,
-            instruct=instruct,
-            speed=speed,
-        )
-        
-        return audio, sr
-        
-    except Exception as e:
-        raise RuntimeError(f"Speech generation failed: {e}")
+
+    # Use batch scheduler if available (official backend)
+    scheduler = get_batch_scheduler()
+    if scheduler and scheduler.is_running:
+        return await scheduler.submit(text, voice_name, language, instruct, speed)
+
+    # Fallback: single backend (vllm or scheduler not started)
+    backend = await get_tts_backend()
+    audio, sr = await backend.generate_speech(
+        text=text, voice=voice_name, language=language,
+        instruct=instruct, speed=speed,
+    )
+    return audio, sr
 
 
 @router.post("/audio/speech")
@@ -212,7 +196,7 @@ async def create_speech(
     try:
         # Normalize input text
         normalized_text = normalize_text(request.input, request.normalization_options)
-        
+
         if not normalized_text.strip():
             raise HTTPException(
                 status_code=400,
@@ -222,26 +206,59 @@ async def create_speech(
                     "type": "invalid_request_error",
                 },
             )
-        
+
+        # Resolve voice name before cache lookup so cache key is canonical
+        voice_name = get_voice_name(request.voice)
+
+        # Check persistent audio cache
+        cached_path = await get_cached(
+            text=normalized_text,
+            voice=voice_name,
+            speed=request.speed,
+            fmt=request.response_format,
+        )
+        if cached_path:
+            content_type = get_content_type(request.response_format)
+            return FileResponse(
+                cached_path,
+                media_type=content_type,
+                headers={
+                    "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
+                    "X-Cache": "HIT",
+                },
+            )
+
         # Extract language from model name if present, otherwise use request language
         model_language = extract_language_from_model(request.model)
         language = model_language if model_language else (request.language or "Auto")
-        
-        # Generate speech
+
+        # Generate speech (pass resolved voice_name, not raw request.voice)
         audio, sample_rate = await generate_speech(
             text=normalized_text,
-            voice=request.voice,
+            voice=voice_name,
             language=language,
             instruct=request.instruct,
             speed=request.speed,
         )
-        
+
         # Encode audio to requested format
         audio_bytes = encode_audio(audio, request.response_format, sample_rate)
-        
+
+        # Cache the result
+        try:
+            await put_cached(
+                text=normalized_text,
+                voice=voice_name,
+                speed=request.speed,
+                fmt=request.response_format,
+                data=audio_bytes,
+            )
+        except Exception as cache_err:
+            logger.warning(f"Failed to cache audio: {cache_err}")
+
         # Get content type
         content_type = get_content_type(request.response_format)
-        
+
         # Return audio response
         return Response(
             content=audio_bytes,
@@ -249,6 +266,7 @@ async def create_speech(
             headers={
                 "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
                 "Cache-Control": "no-cache",
+                "X-Cache": "MISS",
             },
         )
         

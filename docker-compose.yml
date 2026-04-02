@@ -25,6 +25,9 @@ services:
       # Auto-unload model after N minutes of inactivity to free VRAM (0=disabled)
       # Useful when sharing GPU with other apps like Ollama, Kokoro TTS, etc.
       - TTS_INACTIVITY_TIMEOUT_MINUTES=15
+      # Batch inference config
+      - TTS_BATCH_MAX_SIZE=4
+      - TTS_BATCH_MAX_WAIT_MS=50
       # When using device_ids filter, the GPU appears as device 0 inside container
       - CUDA_VISIBLE_DEVICES=0
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility

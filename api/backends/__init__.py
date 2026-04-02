@@ -7,6 +7,7 @@ Backend implementations for Qwen3-TTS.
 from .base import TTSBackend
 from .factory import (
     get_backend,
+    get_batch_scheduler,
     initialize_backend,
     unload_backend,
     update_activity,
@@ -19,6 +20,7 @@ from .factory import (
 __all__ = [
     "TTSBackend",
     "get_backend",
+    "get_batch_scheduler",
     "initialize_backend",
     "unload_backend",
     "update_activity",

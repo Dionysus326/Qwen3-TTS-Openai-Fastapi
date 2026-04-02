@@ -65,6 +65,13 @@ async def lifespan(app: FastAPI):
     logger.info(f"Web Interface: http://{HOST}:{PORT}/")
     logger.info(boundary)
     
+    # Enforce audio cache size limits on startup
+    try:
+        from .services.audio_cache import cleanup_cache
+        await cleanup_cache()
+    except Exception as e:
+        logger.warning(f"Cache cleanup on startup failed: {e}")
+
     # Pre-load the TTS backend
     try:
         from .backends import initialize_backend, start_auto_unload, INACTIVITY_TIMEOUT_MINUTES

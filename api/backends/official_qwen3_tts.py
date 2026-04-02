@@ -201,19 +201,30 @@ class OfficialQwen3TTSBackend(TTSBackend):
             logger.info(f"Creating voice clone prompt for: {voice_name}")
             # Create voice clone prompt (x_vector_only_mode=True means no transcript needed)
             try:
-                self._voice_prompts_cache[cache_key] = self.model.create_voice_clone_prompt(
-                    ref_audio=voice_path,
-                    x_vector_only_mode=True,  # Don't require transcript
+                import asyncio
+                loop = asyncio.get_running_loop()
+                self._voice_prompts_cache[cache_key] = await loop.run_in_executor(
+                    None,
+                    lambda: self.model.create_voice_clone_prompt(
+                        ref_audio=voice_path,
+                        x_vector_only_mode=True,
+                    ),
                 )
             except Exception as e:
                 logger.error(f"Failed to create voice clone prompt: {e}")
                 raise
         
-        # Generate speech with cached voice prompt
-        wavs, sr = self.model.generate_voice_clone(
-            text=text,
-            language=language,
-            voice_clone_prompt=self._voice_prompts_cache[cache_key],
+        # Generate speech with cached voice prompt (run in thread to unblock event loop)
+        import asyncio
+        loop = asyncio.get_running_loop()
+        voice_prompt = self._voice_prompts_cache[cache_key]
+        wavs, sr = await loop.run_in_executor(
+            None,
+            lambda: self.model.generate_voice_clone(
+                text=text,
+                language=language,
+                voice_clone_prompt=voice_prompt,
+            ),
         )
         
         audio = wavs[0]
@@ -265,12 +276,17 @@ class OfficialQwen3TTSBackend(TTSBackend):
                     f"Available voices: {available}"
                 )
             
-            # CustomVoice model - use built-in voices
-            wavs, sr = self.model.generate_custom_voice(
-                text=text,
-                language=language,
-                speaker=voice,
-                instruct=instruct,
+            # CustomVoice model - use built-in voices (run in thread to unblock event loop)
+            import asyncio
+            loop = asyncio.get_running_loop()
+            wavs, sr = await loop.run_in_executor(
+                None,
+                lambda: self.model.generate_custom_voice(
+                    text=text,
+                    language=language,
+                    speaker=voice,
+                    instruct=instruct,
+                ),
             )
             
             audio = wavs[0]
@@ -285,6 +301,61 @@ class OfficialQwen3TTSBackend(TTSBackend):
             logger.error(f"Speech generation failed: {e}")
             raise RuntimeError(f"Speech generation failed: {e}")
     
+    def generate_batch_sync(
+        self,
+        texts: List[str],
+        voice: str,
+        language: str,
+        instruct: Optional[str],
+    ) -> Tuple[List[np.ndarray], int]:
+        """Synchronous batch generation for use in thread executor.
+
+        Args:
+            texts: List of texts to synthesize
+            voice: Resolved voice name (same for all items)
+            language: Language name
+            instruct: Optional instruction
+
+        Returns:
+            Tuple of (list of audio arrays, sample_rate)
+        """
+        custom_voice = self._get_custom_voice(voice)
+
+        if custom_voice:
+            voice_path = custom_voice["path"]
+            # Ensure voice prompt is cached
+            if voice_path not in self._voice_prompts_cache:
+                logger.info(f"Creating voice clone prompt for batch: {custom_voice['name']}")
+                self._voice_prompts_cache[voice_path] = self.model.create_voice_clone_prompt(
+                    ref_audio=voice_path,
+                    x_vector_only_mode=True,
+                )
+            prompt_items = self._voice_prompts_cache[voice_path]
+            # prompt_items is List[VoiceClonePromptItem] (length 1)
+            # Model broadcasts single item to all texts (line 578-579 of qwen3_tts_model.py)
+            wavs, sr = self.model.generate_voice_clone(
+                text=texts,
+                language=language,
+                voice_clone_prompt=prompt_items,
+            )
+            return wavs, sr
+
+        if self._is_base_model:
+            available = list(set(v["name"] for v in self._custom_voices.values()))
+            raise ValueError(
+                f"Voice '{voice}' not found. Available custom voices: {available}"
+            )
+
+        # CustomVoice model — batch with per-item params
+        n = len(texts)
+        wavs, sr = self.model.generate_custom_voice(
+            text=texts,
+            speaker=[voice] * n,
+            language=[language] * n,
+            instruct=[instruct] * n if instruct else None,
+        )
+        return wavs, sr
+
     def get_backend_name(self) -> str:
         """Return the name of this backend."""
         return "official"
